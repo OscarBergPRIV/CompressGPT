@@ -22,6 +22,7 @@ from typing import Optional, Union
 import torch
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+import copy
 
 #from transformers import initialization as init
 from transformers.activations import ACT2FN, get_activation
@@ -49,25 +50,25 @@ from transformers.models.gpt2.modeling_gpt2 import GPT2PreTrainedModel
 from transformers import GPT2Tokenizer
 
 def eager_attention_forward_split(module, query, key, value, attention_mask, **kwargs):
-    print(f"  [EAGER ATTENTION] Query shape: {query.shape}, Key shape: {key.shape}, Value shape: {value.shape}")
+    #print(f"  [EAGER ATTENTION] Query shape: {query.shape}, Key shape: {key.shape}, Value shape: {value.shape}")
     
     attn_weights = torch.matmul(query, key.transpose(-1, -2))
-    print(f"  [EAGER ATTENTION] Attention weights shape after Q@K^T: {attn_weights.shape}")
+    #print(f"  [EAGER ATTENTION] Attention weights shape after Q@K^T: {attn_weights.shape}")
 
     if module.scale_attn_weights:
         scale = value.size(-1) ** 0.5
         attn_weights = attn_weights / torch.full(
             [], scale, dtype=attn_weights.dtype, device=attn_weights.device
         )
-        print(f"  [EAGER ATTENTION] Scaled by sqrt(d_k) = {scale:.2f}")
+        #print(f"  [EAGER ATTENTION] Scaled by sqrt(d_k) = {scale:.2f}")
 
     # Layer-wise attention scaling
     if module.scale_attn_by_inverse_layer_idx:
         layer_scale = float(module.layer_idx + 1)
         attn_weights = attn_weights / layer_scale
-        print(f"  [EAGER ATTENTION] Scaled by inverse layer idx: {layer_scale}")
+        #print(f"  [EAGER ATTENTION] Scaled by inverse layer idx: {layer_scale}")
 
-    print("attn weight.shape: ", attn_weights.shape)
+    #print("attn weight.shape: ", attn_weights.shape)
 
     if not module.is_cross_attention:
         # if only "normal" attention layer implements causal mask
@@ -75,25 +76,25 @@ def eager_attention_forward_split(module, query, key, value, attention_mask, **k
         causal_mask = module.bias[:, :, key_length - query_length : key_length, :key_length]
         mask_value = torch.finfo(attn_weights.dtype).min
 
-        print("query len, key len: ", query_length, key_length)
+        #print("query len, key len: ", query_length, key_length)
         #causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length]
-        print("Causal_mask: ", causal_mask)
+        #print("Causal_mask: ", causal_mask)
 
         # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
         # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
         mask_value = torch.full([], mask_value, dtype=attn_weights.dtype, device=attn_weights.device)
         attn_weights = torch.where(causal_mask, attn_weights.to(attn_weights.dtype), mask_value)
-        print(f"  [EAGER ATTENTION] Applied causal mask (query_len={query_length}, key_len={key_length})")
+        #print(f"  [EAGER ATTENTION] Applied causal mask (query_len={query_length}, key_len={key_length})")
 
     if attention_mask is not None:
         # Apply the attention mask
         causal_mask = attention_mask[:, :, :, : key.shape[-2]]
         attn_weights = attn_weights + causal_mask
-        print(f"  [EAGER ATTENTION] Applied attention mask")
+        #print(f"  [EAGER ATTENTION] Applied attention mask")
         #print("Attn weights mask: ", attn_weights)
 
     attn_weights = nn.functional.softmax(attn_weights, dim=-1)
-    print(f"  [EAGER ATTENTION] Applied softmax")
+    #print(f"  [EAGER ATTENTION] Applied softmax")
 
     # Downcast (if necessary) back to V's dtype (if in mixed-precision) -- No-Op otherwise
     attn_weights = attn_weights.type(value.dtype)
@@ -101,7 +102,7 @@ def eager_attention_forward_split(module, query, key, value, attention_mask, **k
 
     attn_output = torch.matmul(attn_weights, value)
     attn_output = attn_output.transpose(1, 2)
-    print(f"  [EAGER ATTENTION] Output shape after attention: {attn_output.shape}")
+    #print(f"  [EAGER ATTENTION] Output shape after attention: {attn_output.shape}")
 
     return attn_output, attn_weights
 
@@ -141,7 +142,7 @@ class GPT2AttentionSplit(nn.Module):
 
 
         
-        print(f"[GPT2Attention.__init__] embed_dim={self.embed_dim}, num_heads={self.num_heads}, head_dim={self.head_dim}")
+        #print(f"[GPT2Attention.__init__] embed_dim={self.embed_dim}, num_heads={self.num_heads}, head_dim={self.head_dim}")
         
         #if self.head_dim * self.num_heads != self.embed_dim:
         #    raise ValueError(
@@ -173,7 +174,7 @@ class GPT2AttentionSplit(nn.Module):
         self.is_causal = not is_cross_attention
 
     def _upcast_and_reordered_attn_split(self, query, key, value, attention_mask=None):
-        print(f"  [UPCAST ATTENTION] Using upcast and reordered attention")
+        #print(f"  [UPCAST ATTENTION] Using upcast and reordered attention")
         # Use `torch.baddbmm` (a bit more efficient w/ alpha param for scaling -- from Megatron-LM)
         bsz, num_heads, q_seq_len, dk = query.size()
         _, _, k_seq_len, _ = key.size()
@@ -189,7 +190,7 @@ class GPT2AttentionSplit(nn.Module):
         if self.scale_attn_by_inverse_layer_idx:
             scale_factor /= float(self.layer_idx + 1)
         
-        print(f"  [UPCAST ATTENTION] Scale factor: {scale_factor:.6f}")
+        #print(f"  [UPCAST ATTENTION] Scale factor: {scale_factor:.6f}")
 
         # Upcast (turn off autocast) and reorder (Scale K by 1 / root(dk))
         with torch.autocast(query.device.type, enabled=False):
@@ -200,20 +201,19 @@ class GPT2AttentionSplit(nn.Module):
         if not self.is_cross_attention:
             # if only "normal" attention layer implements causal mask
             query_length, key_length = query.size(-2), key.size(-2)
-            print("query len, key len: ", query_length, key_length)
+            #print("query len, key len: ", query_length, key_length)
             causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length]
-            print("Causal_mask: ", causal_mask)
             mask_value = torch.finfo(attn_weights.dtype).min
             # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
             # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
             mask_value = torch.tensor(mask_value, dtype=attn_weights.dtype, device=attn_weights.device)
             attn_weights = torch.where(causal_mask, attn_weights, mask_value)
-            print(f"  [UPCAST ATTENTION] Applied causal mask")
+            #print(f"  [UPCAST ATTENTION] Applied causal mask")
 
         if attention_mask is not None:
             # Apply the attention mask
             attn_weights = attn_weights + attention_mask
-            print(f"  [UPCAST ATTENTION] Applied attention mask")
+            #print(f"  [UPCAST ATTENTION] Applied attention mask")
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
 
@@ -239,10 +239,10 @@ class GPT2AttentionSplit(nn.Module):
         output_attentions: Optional[bool] = False,
         **kwargs,
     ) -> tuple[Union[torch.Tensor, tuple[torch.Tensor]], ...]:
-        print(f"\n[ {self.layer_idx}, input shape: {hidden_states.shape}")
+        #print(f"\n[ {self.layer_idx}, input shape: {hidden_states.shape}")
         
         is_cross_attention = encoder_hidden_states is not None
-        print(f"[GPT2Attention.forward] is_cross_attention: {is_cross_attention}")
+        #print(f"[GPT2Attention.forward] is_cross_attention: {is_cross_attention}")
         
         if past_key_values is not None:
             if isinstance(past_key_values, EncoderDecoderCache):
@@ -263,29 +263,29 @@ class GPT2AttentionSplit(nn.Module):
                 )
             query_states = self.q_attn(hidden_states)
             attention_mask = encoder_attention_mask
-            print(f"[GPT2Attention.forward] Cross-attention: query from hidden_states")
+            #print(f"[GPT2Attention.forward] Cross-attention: query from hidden_states")
 
             # Try to get key/value states from cache if possible
             if past_key_values is not None and is_updated:
                 key_states = curr_past_key_values.layers[self.layer_idx].keys
                 value_states = curr_past_key_values.layers[self.layer_idx].values
-                print(f"[GPT2Attention.forward] Using cached key/value states")
+                #print(f"[GPT2Attention.forward] Using cached key/value states")
             else:
                 key_states, value_states = self.c_attn(encoder_hidden_states).split(self.split_size, dim=2)
                 shape_kv = (*key_states.shape[:-1], -1, self.head_dim)
                 key_states = key_states.view(shape_kv).transpose(1, 2)
                 value_states = value_states.view(shape_kv).transpose(1, 2)
-                print(f"[GPT2Attention.forward] Computing key/value from encoder_hidden_states")
+                #print(f"[GPT2Attention.forward] Computing key/value from encoder_hidden_states")
         else:
             query_states, key_states, value_states = self.c_attn(hidden_states).split(self.split_size, dim=2)
-            print(f"[GPT2Attention.forward] Self-attention: split QKV from c_attn output")
+            #print(f"[GPT2Attention.forward] Self-attention: split QKV from c_attn output")
             shape_kv = (*key_states.shape[:-1], -1, self.head_dim)
             key_states = key_states.view(shape_kv).transpose(1, 2)
             value_states = value_states.view(shape_kv).transpose(1, 2)
 
         shape_q = (*query_states.shape[:-1], -1, self.head_dim)
         query_states = query_states.view(shape_q).transpose(1, 2)
-        print(f"[GPT2Attention.forward] Reshaped Q: {query_states.shape}, K: {key_states.shape}, V: {value_states.shape}")
+        #print(f"[GPT2Attention.forward] Reshaped Q: {query_states.shape}, K: {key_states.shape}, V: {value_states.shape}")
 
         if (past_key_values is not None and not is_cross_attention) or (
             past_key_values is not None and is_cross_attention and not is_updated
@@ -304,7 +304,7 @@ class GPT2AttentionSplit(nn.Module):
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        print(f"[GPT2Attention.forward] Using attention implementation: {self.config._attn_implementation}")
+        #print(f"[GPT2Attention.forward] Using attention implementation: {self.config._attn_implementation}")
 
         if using_eager and self.reorder_and_upcast_attn:
             attn_output, attn_weights = self._upcast_and_reordered_attn_split(
@@ -322,11 +322,11 @@ class GPT2AttentionSplit(nn.Module):
             )
 
         attn_output = attn_output.reshape(*attn_output.shape[:-2], -1).contiguous()
-        print(f"[GPT2Attention.forward] Reshaped attention output: {attn_output.shape}")
+        #print(f"[GPT2Attention.forward] Reshaped attention output: {attn_output.shape}")
         
         attn_output = self.c_proj(attn_output)
         attn_output = self.resid_dropout(attn_output)
-        print(f"[GPT2Attention.forward] After projection and dropout: {attn_output.shape}")
+        #print(f"[GPT2Attention.forward] After projection and dropout: {attn_output.shape}")
 
         return attn_output, attn_weights
 
@@ -346,16 +346,16 @@ class GPT2MLPSPLIT(nn.Module):
         self.dropout = nn.Dropout(config.resid_pdrop)
 
     def forward(self, hidden_states: Optional[tuple[torch.FloatTensor]]) -> torch.FloatTensor:
-        print(f"[GPT2MLP.forward] Input shape: {hidden_states.shape}")
+        #print(f"[GPT2MLP.forward] Input shape: {hidden_states.shape}")
         
         hidden_states = self.c_fc(hidden_states)
-        print(f"[GPT2MLP.forward] After c_fc: {hidden_states.shape}")
+        #print(f"[GPT2MLP.forward] After c_fc: {hidden_states.shape}")
         
         hidden_states = self.act(hidden_states)
-        print(f"[GPT2MLP.forward] After activation")
+        #print(f"[GPT2MLP.forward] After activation")
         
         hidden_states = self.c_proj(hidden_states)
-        print(f"[GPT2MLP.forward] After c_proj: {hidden_states.shape}")
+        #print(f"[GPT2MLP.forward] After c_proj: {hidden_states.shape}")
         
         hidden_states = self.dropout(hidden_states)
         return hidden_states
@@ -367,7 +367,7 @@ class GPT2BlockSplit(GradientCheckpointingLayer):
         print(f"\n[GPT2Block.__init__] Initializing block {layer_idx}")
         
         hidden_size = config.hidden_size # // int(ratio)    # NEW
-        inner_dim = config.n_inner if config.n_inner is not None else 4 * hidden_size
+        inner_dim = 4 * hidden_size # config.n_inner if config.n_inner is not None else 4 * hidden_size
         print(f"[GPT2Block.__init__] hidden_size={hidden_size}, inner_dim={inner_dim}")
 
         self.ln_1 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
@@ -393,13 +393,13 @@ class GPT2BlockSplit(GradientCheckpointingLayer):
         output_attentions: Optional[bool] = False,
         **kwargs,
     ) -> Union[tuple[torch.Tensor], Optional[tuple[torch.Tensor, tuple[torch.FloatTensor, ...]]]]:
-        print(f"\n{'='*60}")
-        print(f"[GPT2Block.forward] Processing block")
-        print(f"{'='*60}")
+        #print(f"\n{'='*60}")
+        #print(f"[GPT2Block.forward] Processing block")
+        #print(f"{'='*60}")
         
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
-        print(f"[GPT2Block.forward] After ln_1 (pre-attention LayerNorm)")
+        #print(f"[GPT2Block.forward] After ln_1 (pre-attention LayerNorm)")
         
         attn_output, self_attn_weights = self.attn(
             hidden_states,
@@ -413,7 +413,7 @@ class GPT2BlockSplit(GradientCheckpointingLayer):
         # residual connection
         # NEw TODO uncomment
         hidden_states = attn_output     # + residual
-        print(f"[GPT2Block.forward] After self-attention w/o residual: {hidden_states.shape}")
+        #print(f"[GPT2Block.forward] After self-attention w/o residual: {hidden_states.shape}")
 
         
         if encoder_hidden_states is not None:
@@ -425,7 +425,7 @@ class GPT2BlockSplit(GradientCheckpointingLayer):
                 )
             residual = hidden_states
             hidden_states = self.ln_cross_attn(hidden_states)
-            print(f"[GPT2Block.forward] Processing cross-attention")
+            #print(f"[GPT2Block.forward] Processing cross-attention")
             
             cross_attn_output, cross_attn_weights = self.crossattention(
                 hidden_states,
@@ -437,16 +437,16 @@ class GPT2BlockSplit(GradientCheckpointingLayer):
             )
             # residual connection TODO
             hidden_states = residual + cross_attn_output
-            print(f"[GPT2Block.forward] After cross-attention + residual: {hidden_states.shape}")
+            #print(f"[GPT2Block.forward] After cross-attention + residual: {hidden_states.shape}")
 
         residual = hidden_states
         hidden_states = self.ln_2(hidden_states)
-        print(f"[GPT2Block.forward] After ln_2 (pre-MLP LayerNorm)")
+        #print(f"[GPT2Block.forward] After ln_2 (pre-MLP LayerNorm)")
         
         feed_forward_hidden_states = self.mlp(hidden_states)
         # residual connection
         hidden_states = residual + feed_forward_hidden_states
-        print(f"[GPT2Block.forward] After MLP + residual: {hidden_states.shape}")
+        #print(f"[GPT2Block.forward] After MLP + residual: {hidden_states.shape}")
 
         outputs = (hidden_states,)
         if output_attentions:
@@ -463,13 +463,19 @@ class BottleneckAttention(GPT2PreTrainedModel):
         super().__init__(config)
 
         self.embed_dim = config.hidden_size
+        print("AT THE BEGINNIGN IN BOTTLENECK EMBED DIM: ", self.embed_dim)
 
         #self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
         self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
 
         self.drop = nn.Dropout(config.embd_pdrop)
-        self.h = nn.ModuleList([GPT2BlockSplit(config, layer_idx=0, ratio=ratio) ])
-        self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
+        config_dec = copy.deepcopy(config)
+        config_dec.hidden_size = int(config.hidden_size / ratio)
+        print("config hidden shape: ", config.hidden_size)
+        print("config_dec hidden shape: ", config_dec.hidden_size)
+        
+        self.h = nn.ModuleList([GPT2BlockSplit(config, layer_idx=0, ratio=ratio), GPT2BlockSplit(config_dec, layer_idx=1, ratio=1/ratio)])
+        #self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
 
         self.gradient_checkpointing = False
         self._attn_implementation = config._attn_implementation
@@ -582,7 +588,7 @@ class BottleneckAttention(GPT2PreTrainedModel):
             position_ids=position_ids,
         )
 
-        print("Causal mask: \n", causal_mask)
+        #print("Causal mask: \n", causal_mask)
 
         # If a 2D or 3D attention mask is provided for the cross-attention
         # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
@@ -628,7 +634,7 @@ class BottleneckAttention(GPT2PreTrainedModel):
             )
 
             hidden_states = outputs[0]
-            print("hidden states in Bottleneck after Attn: ", hidden_states.shape)
+            #print("hidden states in Bottleneck after Attn: ", hidden_states.shape)
 
             if output_attentions:
                 all_self_attentions = all_self_attentions + (outputs[1],)
@@ -684,7 +690,7 @@ if __name__ == "__main__":
     batch_size = 2
     seq_length = 10
     hidden_size = config_BL.hidden_size
-    ratio = 2
+    ratio = 6.0
 
     config = GPT2Config.from_pretrained("gpt2")
     config._attn_implementation = "eager"
@@ -746,6 +752,7 @@ if __name__ == "__main__":
     
     output_hidden_states = outputs[0]
     print("Shape out Bottleneck: ", output_hidden_states.shape)
+    assert output_hidden_states.shape == hidden_states.shape, "Are you fucking stupid?"
 
     print("\n" + "="*80)
     print("TEST COMPLETED SUCCESSFULLY!")
