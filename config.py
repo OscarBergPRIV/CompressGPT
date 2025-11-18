@@ -10,13 +10,13 @@ class CFG_M:
         
         # Bottleneck configuration
         self.bl_layer = 3  # Layer position for bottleneck (0-11 for GPT-2)
-        self.bl_ratio = 16  # Compression ratio (hidden_dim / bl_ratio)
-        
+        self.bl_ratio = 4  # Compression ratio (hidden_dim / bl_ratio)
+        self.BL_type = "linear" # attention
         # Training configuration
         self.num_epochs = 1  # Number of training epochs
         
         # Model selection
-        self.default = True  # If True, use standard GPT-2; if False, use compressed version
+        self.default = False  # If True, use standard GPT-2; if False, use compressed version
     
     def print_cfg(self):
         """Print current configuration settings."""
@@ -25,6 +25,7 @@ class CFG_M:
         print(f"  LoRA rank: {self.r_LoRA}")
         print(f"  Bottleneck layer: {self.bl_layer}")
         print(f"  Bottleneck ratio: {self.bl_ratio}")
+        print(f"  Bottleneck type: {self.BL_type}")
         print(f"  Using default model: {self.default}")
 
 
