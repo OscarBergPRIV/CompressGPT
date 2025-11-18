@@ -51,6 +51,8 @@ from transformers.utils import (
 )
 from transformers.models.gpt2.configuration_gpt2 import GPT2Config
 from transformers import GPT2Tokenizer
+from config import CFG_M
+
 
 # ============================================================================
 # Bottleneck Modules for Compression
@@ -79,7 +81,95 @@ class AdaptiveBottleneck(nn.Module):
         decompressed = self.decompress(compressed)
         return decompressed
 
+class AttentionBottleneck(nn.Module):
+    """
+    Uses cross-attention to compress sequence to fixed number of latent tokens,
+    then expands back. This is sequence-length agnostic and captures global context.
+    
+    Based on Perceiver architecture - compresses arbitrary length to fixed latents.
+    """
+    def __init__(self, hidden_size=768, num_latents=32, latent_dim=None, num_heads=8):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_latents = num_latents
+        self.latent_dim = latent_dim or hidden_size // 2
+        self.num_heads = num_heads
+        
+        # Learnable latent queries for compression
+        self.latent_queries = nn.Parameter(torch.randn(1, num_latents, self.latent_dim))
+        
+        # Cross-attention for compression (latents attend to input)
+        self.compress_attn = nn.MultiheadAttention(
+            embed_dim=self.latent_dim,
+            num_heads=num_heads,
+            kdim=hidden_size,
+            vdim=hidden_size,
+            batch_first=True
+        )
+        
+        # Cross-attention for decompression (input positions attend to latents)
+        self.decompress_attn = nn.MultiheadAttention(
+            embed_dim=hidden_size,
+            num_heads=num_heads,
+            kdim=self.latent_dim,
+            vdim=self.latent_dim,
+            batch_first=True
+        )
+        
+        # Layer norms
+        self.compress_norm = nn.LayerNorm(self.latent_dim)
+        self.decompress_norm = nn.LayerNorm(hidden_size)
+        
+        # Positional encoding for decompression queries
+        self.pos_encoding = None
+        
+    def _get_positional_encoding(self, seq_len, device):
+        """Generate or retrieve cached positional encoding."""
+        if self.pos_encoding is None or self.pos_encoding.size(1) < seq_len:
+            # Create positional encoding
+            position = torch.arange(seq_len, device=device).unsqueeze(1)
+            div_term = torch.exp(torch.arange(0, self.hidden_size, 2, device=device) * 
+                               (-math.log(10000.0) / self.hidden_size))
+            
+            pe = torch.zeros(seq_len, self.hidden_size, device=device)
+            pe[:, 0::2] = torch.sin(position * div_term)
+            pe[:, 1::2] = torch.cos(position * div_term)
+            self.pos_encoding = pe.unsqueeze(0)  # [1, seq_len, hidden_size]
+        
+        return self.pos_encoding[:, :seq_len, :]
+        
+    def forward(self, hidden_states):
+        """
+        Args:
+            hidden_states: [batch, seq_len, hidden_size]
+        Returns:
+            reconstructed: [batch, seq_len, hidden_size]
+        """
+        batch_size, seq_len, _ = hidden_states.shape
+        
+        # Compression: latent queries attend to input sequence
+        latents = self.latent_queries.expand(batch_size, -1, -1)
+        compressed, _ = self.compress_attn(
+            query=latents,
+            key=hidden_states,
+            value=hidden_states
+        )
+        compressed = self.compress_norm(compressed + latents)
+        
+        # Decompression: positional queries attend to compressed latents
+        pos_queries = self._get_positional_encoding(seq_len, hidden_states.device)
+        pos_queries = pos_queries.expand(batch_size, -1, -1)
+        
+        reconstructed, _ = self.decompress_attn(
+            query=pos_queries,
+            key=compressed,
+            value=compressed
+        )
+        reconstructed = self.decompress_norm(reconstructed + pos_queries)
+        
+        return reconstructed
 
+# this was for some experiments for gated progressive Bottleneck
 class SplitBottleneck(nn.Module):
     """
     Bottleneck with learnable gating mechanism.
@@ -123,7 +213,7 @@ class SplitBottleneck(nn.Module):
 class GPT2ModelCompress(GPT2PreTrainedModel):
     _supports_param_buffer_assignment = False
 
-    def __init__(self, config, bl_layer=None, bl_ratio=2):
+    def __init__(self, config, bl_layer=None, bl_ratio=2, BL_type="linear"):
         super().__init__(config)
 
         self.embed_dim = config.hidden_size
@@ -146,7 +236,10 @@ class GPT2ModelCompress(GPT2PreTrainedModel):
         ## Bottleneck
         if bl_layer is not None:
             self.bl_layer = bl_layer
-            self.bottleneck = AdaptiveBottleneck(ratio=bl_ratio) # SplitBottleneck(ratio=bl_ratio) #   AdaptiveBottleneck(ratio=bl_ratio)
+            if BL_type == "linear":
+                self.bottleneck = AdaptiveBottleneck(ratio=bl_ratio) # SplitBottleneck(ratio=bl_ratio) #   AdaptiveBottleneck(ratio=bl_ratio)
+            elif BL_type == "attention":
+                self.attention = AttentionBottleneck(ratio=bl_ratio)
 
     def get_input_embeddings(self):
         return self.wte
@@ -341,11 +434,11 @@ class GPT2LMHeadModelCompress(GPT2PreTrainedModel, GenerationMixin):
     """
     _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config, bl_layer=None, bl_ratio=2):
+    def __init__(self, config, bl_layer=None, bl_ratio=2, BL_type="linear"):
         super().__init__(config)
         print(f"Initializing GPT2LMHeadModelCompress (bl_layer={bl_layer}, bl_ratio={bl_ratio})")
         
-        self.transformer = GPT2ModelCompress(config, bl_layer=bl_layer, bl_ratio=bl_ratio)
+        self.transformer = GPT2ModelCompress(config, bl_layer=bl_layer, bl_ratio=bl_ratio, BL_type=BL_type)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
         self.post_init()
