@@ -15,6 +15,7 @@ import os
 import math
 from evaluate import load
 import matplotlib.pyplot as plt
+import argparse
 
 # Local imports
 from modeling_GPT_compress import GPT2LMHeadModelCompress, GPT2LMHeadModel
@@ -263,6 +264,14 @@ def evaluate(model, generate_examples=True, num_examples=3, full_metrics=False):
 
 def main():
     """Main training loop."""
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--path_BL", type=str, default="/home/oscar.berg/compressGPT/checkpoints_bottleneck/_r_4_pos_3/best.pt",  help="Path to traind BL architecture")
+    #parser.add_argument("--BL_type", type=str, default="linear",  help="Path to traind BL architecture")
+
+    args = parser.parse_args()
+
+    
     print("\n" + "="*80)
     print("INITIALIZING MODEL")
     print("="*80)
@@ -274,7 +283,8 @@ def main():
         model = GPT2LMHeadModelCompress(
             config, 
             bl_layer=cfg_m.bl_layer, 
-            bl_ratio=cfg_m.bl_ratio
+            bl_ratio=cfg_m.bl_ratio,
+            BL_type=cfg_m.BL_type
         )
         original_model = GPT2LMHeadModel.from_pretrained(model_name)
         model.transformer.load_state_dict(original_model.transformer.state_dict(), strict=False)
@@ -287,7 +297,22 @@ def main():
     # Resize embeddings if needed
     if len(tokenizer) != model.config.vocab_size:
         model.resize_token_embeddings(len(tokenizer))
-    
+
+    # --- SILENCE WARNING & BE FUTURE-PROOF ---
+    """
+    if tokenizer.pad_token is None or tokenizer.pad_token == tokenizer.eos_token:
+        print("Adding [PAD] token to fix warning...")
+        tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+        model.resize_token_embeddings(len(tokenizer))
+    """
+
+
+    if args.path_BL is not None:
+        print("Loading the pretrained bottleneck architecture...")
+        checkpoint = torch.load(args.path_BL, map_location=device)
+        bottleneck_state_dict = checkpoint['model_state_dict']
+        model.transformer.bottleneck.load_state_dict(bottleneck_state_dict, strict=True)
+
     model.to(device)
     
     # LoRA configuration
