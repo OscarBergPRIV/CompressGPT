@@ -520,6 +520,7 @@ class BottleneckAttention(GPT2PreTrainedModel):
 
             [What are input IDs?](../glossary#input-ids)
         """
+
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -541,7 +542,6 @@ class BottleneckAttention(GPT2PreTrainedModel):
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
         device = input_ids.device if input_ids is not None else inputs_embeds.device
-
         if token_type_ids is not None:
             token_type_ids = token_type_ids.view(-1, input_shape[-1])
 
