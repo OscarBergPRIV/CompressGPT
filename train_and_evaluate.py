@@ -266,7 +266,7 @@ def main():
     """Main training loop."""
     
     parser = argparse.ArgumentParser()
-    parser.add_argument("--path_BL", type=str, default="/home/oscar.berg/compressGPT/checkpoints_bottleneck/_r_4_pos_3/best.pt",  help="Path to traind BL architecture")
+    parser.add_argument("--path_BL", type=str, default="/home/oscar.berg/compressGPT/checkpoints_bottleneck/_r_16_pos_3_type_attention/best.pt",  help="Path to traind BL architecture")
     #parser.add_argument("--BL_type", type=str, default="linear",  help="Path to traind BL architecture")
 
     args = parser.parse_args()
@@ -312,6 +312,7 @@ def main():
         checkpoint = torch.load(args.path_BL, map_location=device)
         bottleneck_state_dict = checkpoint['model_state_dict']
         model.transformer.bottleneck.load_state_dict(bottleneck_state_dict, strict=True)
+        model.transformer.bottleneck.to(device)
 
     model.to(device)
     
@@ -319,6 +320,7 @@ def main():
     print("\nApplying LoRA...")
     from peft import LoraConfig, get_peft_model
     
+
     lora_config = LoraConfig(
         r=cfg_m.r_LoRA,
         lora_alpha=16,
@@ -328,11 +330,78 @@ def main():
         task_type="CAUSAL_LM",
         modules_to_save=["transformer.bottleneck"] if not cfg_m.default else None,
     )
+
+    if cfg_m.BL_type == "attention":
+        # Step 1: Collect the actual GPT-2 attention modules
+        gpt2_attn_names = []
+
+        for name, module in model.named_modules():
+            if name.startswith("transformer.h.") and ("attn.c_attn" in name or "attn.c_proj" in name):
+                if "bottleneck" not in name:
+                    gpt2_attn_names.append(name)  # keep full path
+
+        lora_config = LoraConfig(
+            r=cfg_m.r_LoRA,
+            lora_alpha=16,
+            lora_dropout=0.05,
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules=gpt2_attn_names,
+            modules_to_save=None,
+        )
+
+
     model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()
+
+    if cfg_m.BL_type == "attention":
+        try:
+            # Try to access it directly via the path in the PEFT model structure
+            # PEFT often wraps the base model inside 'base_model.model'
+            bottleneck_module = model.base_model.model.transformer.bottleneck
+        except AttributeError:
+            # If the above fails, try accessing it directly on the unwrapped model structure
+            bottleneck_module = model.transformer.bottleneck 
+
+        # Iterate through all parameters within the identified bottleneck module
+        print("Re-enabling requires_grad for all parameters in the Bottleneck module...")
+        # 
+
+        trainable_count = 0
+        for name, param in bottleneck_module.named_parameters():
+            # Set requires_grad to True to enable full fine-tuning for this module
+            param.requires_grad = True
+            trainable_count += 1
+
+        print(f"✅ Successfully enabled full training for {trainable_count} parameters in the Bottleneck layer.")
+
+        model.print_trainable_parameters()
+        # Optional: check which modules got LoRA adapters
+        for name, module in model.named_modules():
+            if hasattr(module, "lora_A"):
+                print("LoRA injected into ->", name)
+
+    
+    """
+    for name, module in model.named_modules():
+        if hasattr(module, "lora_A") and hasattr(module, "lora_B"):
+            print("Module:", name)
+            # Loop over adapters (usually just 'default')
+            for adapter_name in module.lora_A:
+                A = module.lora_A[adapter_name].weight
+                B = module.lora_B[adapter_name].weight
+                print(f"  Adapter: {adapter_name}")
+                print(f"    lora_A mean = {A.mean().item():.6f}, std = {A.std().item():.6f}")
+                print(A)
+                print(B)
+                print(f"    lora_B mean = {B.mean().item():.6f}, std = {B.std().item():.6f}")
+    """
+
     
     # FP16 setup
     use_fp16 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 7
+
+    # hacky to find bug
+    use_fp16 = False
     if use_fp16:
         scaler = torch.cuda.amp.GradScaler()
         print(f"\nUsing FP16 mixed precision (CUDA compute capability: {torch.cuda.get_device_capability()})")
@@ -367,7 +436,7 @@ def main():
     # Baseline evaluation
     print("\n" + "="*80)
     print("BASELINE EVALUATION")
-    print("="*80)
+    print("="*80)     # TODO replace original_model with model
     baseline_ppl, baseline_bleu, baseline_rouge, baseline_bertscore = evaluate(
         model, generate_examples=True, num_examples=2
     )
@@ -501,8 +570,8 @@ def main():
         save_path = f"./metrics_default_r{cfg_m.r_LoRA}.png"
         final_dir = "./gpt2-alpaca-final-default"
     else:
-        save_path = f"./metrics_r{cfg_m.r_LoRA}_bl{cfg_m.bl_layer}_ratio{cfg_m.bl_ratio}.png"
-        final_dir = f"./gpt2-alpaca-final_r{cfg_m.r_LoRA}_bl{cfg_m.bl_layer}_ratio{cfg_m.bl_ratio}"
+        save_path = f"./metrics_r{cfg_m.r_LoRA}_bl{cfg_m.bl_layer}_ratio{cfg_m.bl_ratio}_BL_type_{cfg_m.BL_type}.png"
+        final_dir = f"./gpt2-alpaca-final_r{cfg_m.r_LoRA}_bl{cfg_m.bl_layer}_ratio{cfg_m.bl_ratio}_BL_type_{cfg_m.BL_type}"
     
     plot_metrics(metrics_history, save_path=save_path)
     
