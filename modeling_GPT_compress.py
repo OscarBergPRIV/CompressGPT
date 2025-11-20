@@ -49,6 +49,10 @@ from transformers.utils import (
     auto_docstring,
     logging,
 )
+import inspect
+
+from modeling_AE_Attn import BottleneckAttention
+
 from transformers.models.gpt2.configuration_gpt2 import GPT2Config
 from transformers import GPT2Tokenizer
 from config import CFG_M
@@ -80,14 +84,14 @@ class AdaptiveBottleneck(nn.Module):
         compressed = self.act(self.compress(hidden_states))
         decompressed = self.decompress(compressed)
         return decompressed
-
+"""
 class AttentionBottleneck(nn.Module):
-    """
-    Uses cross-attention to compress sequence to fixed number of latent tokens,
-    then expands back. This is sequence-length agnostic and captures global context.
     
-    Based on Perceiver architecture - compresses arbitrary length to fixed latents.
-    """
+    #Uses cross-attention to compress sequence to fixed number of latent tokens,
+    #then expands back. This is sequence-length agnostic and captures global context.
+    
+    #Based on Perceiver architecture - compresses arbitrary length to fixed latents.
+    
     def __init__(self, hidden_size=768, num_latents=32, latent_dim=None, num_heads=8):
         super().__init__()
         self.hidden_size = hidden_size
@@ -124,7 +128,7 @@ class AttentionBottleneck(nn.Module):
         self.pos_encoding = None
         
     def _get_positional_encoding(self, seq_len, device):
-        """Generate or retrieve cached positional encoding."""
+        #Generate or retrieve cached positional encoding.
         if self.pos_encoding is None or self.pos_encoding.size(1) < seq_len:
             # Create positional encoding
             position = torch.arange(seq_len, device=device).unsqueeze(1)
@@ -139,12 +143,12 @@ class AttentionBottleneck(nn.Module):
         return self.pos_encoding[:, :seq_len, :]
         
     def forward(self, hidden_states):
-        """
-        Args:
-            hidden_states: [batch, seq_len, hidden_size]
-        Returns:
-            reconstructed: [batch, seq_len, hidden_size]
-        """
+        
+        #Args:
+        #    hidden_states: [batch, seq_len, hidden_size]
+        #Returns:
+        #    reconstructed: [batch, seq_len, hidden_size]
+        
         batch_size, seq_len, _ = hidden_states.shape
         
         # Compression: latent queries attend to input sequence
@@ -168,6 +172,7 @@ class AttentionBottleneck(nn.Module):
         reconstructed = self.decompress_norm(reconstructed + pos_queries)
         
         return reconstructed
+"""
 
 # this was for some experiments for gated progressive Bottleneck
 class SplitBottleneck(nn.Module):
@@ -232,14 +237,27 @@ class GPT2ModelCompress(GPT2PreTrainedModel):
         self.post_init()
 
         print("Using Model w/ compression...")
-
+        self.BL_type = BL_type
+        print("Using Bottleneck type: ", self.BL_type)
         ## Bottleneck
         if bl_layer is not None:
             self.bl_layer = bl_layer
             if BL_type == "linear":
                 self.bottleneck = AdaptiveBottleneck(ratio=bl_ratio) # SplitBottleneck(ratio=bl_ratio) #   AdaptiveBottleneck(ratio=bl_ratio)
             elif BL_type == "attention":
-                self.attention = AttentionBottleneck(ratio=bl_ratio)
+                print("Using Attention: ")
+                config_BL = GPT2Config(
+                    hidden_size=768,
+                    num_attention_heads=16,
+                    max_position_embeddings=1024,
+                    scale_attn_weights=True,
+                    attn_pdrop=0.1,
+                    resid_pdrop=0.1,
+                    activation_function="gelu_new",
+                    _attn_implementation="eager"
+                )
+
+                self.bottleneck = BottleneckAttention(config_BL, ratio=bl_ratio)
 
     def get_input_embeddings(self):
         return self.wte
@@ -381,7 +399,21 @@ class GPT2ModelCompress(GPT2PreTrainedModel):
 
             if self.bl_layer == i:
                 #print(f"Bottleneck at layer {i}")
-                hidden_states = self.bottleneck(hidden_states)
+                if self.BL_type == "linear":
+                    hidden_states = self.bottleneck(hidden_states)
+                elif self.BL_type == "attention":
+                    #hidden_states = self.bottleneck(hidden_states)
+                    
+                    hidden_states = self.bottleneck(
+                        inputs_embeds=hidden_states,   # inputs_embeds
+                        attention_mask=attention_mask,
+                        use_cache=use_cache,
+                        #output_hidden_states=False
+                        output_attention=output_attentions
+                        #**kwargs   # TODO I dont know if this is right 100%
+                    )
+                    hidden_states = hidden_states[0]
+
 
             outputs = block(
                 hidden_states,
