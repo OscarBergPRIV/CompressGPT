@@ -10,10 +10,18 @@ class CFG_M:
         
         # Bottleneck configuration
         self.bl_layer = 3  # Layer position for bottleneck (0-11 for GPT-2)
-        self.bl_ratio = 4  # Compression ratio (hidden_dim / bl_ratio)
-        self.BL_type = "linear" # attention
+        self.bl_ratio = 16  # Compression ratio (hidden_dim / bl_ratio)
+        self.BL_type = "linear" # linear or attention or conv
         # Training configuration
         self.num_epochs = 1  # Number of training epochs
+        
+        # quant params
+        self.quant_bits = 0  # 0 means no quantization, i.e. full fp32 smashed data
+
+        # DCT params
+        self.dct_BLOCK = 48
+        self.dct_k = 0  # self.dct_BLOCK // 2 # 0 means no DCT compression 
+        self.dct_reg = False
         
         # Model selection
         self.default = False  # If True, use standard GPT-2; if False, use compressed version
