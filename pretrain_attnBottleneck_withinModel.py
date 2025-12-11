@@ -7,6 +7,7 @@ import math
 import copy
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from transformers import GPT2LMHeadModel as HF_GPT2LMHeadModel
 from transformers.models.gpt2.modeling_gpt2 import (
@@ -20,11 +21,14 @@ from transformers.models.gpt2.configuration_gpt2 import GPT2Config
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 from transformers.generation import GenerationMixin
 from transformers import GPT2Tokenizer
+import glob
 
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Optional, Union
+
+from datetime import datetime
 
 import torch
 from torch import nn
@@ -50,6 +54,8 @@ from transformers.utils import (
     auto_docstring,
     logging,
 )
+
+from torch.utils.data import DataLoader, random_split
 import inspect
 
 from modeling_AE_Attn import BottleneckAttention
@@ -59,8 +65,14 @@ from transformers import GPT2Tokenizer
 from config import CFG_M
 
 from modeling_AE_Attn import GPT2BlockSplit
-from dataset_alpaca import tokenizer, train_dataloader, eval_dataloader, model_name, device, val_ds
+from dataset_alpaca import tokenizer, pretrain_train_dataloader, pretrain_eval_dataloader, model_name, device, val_ds
 from pretrain_attnBottleneck import CombinedLoss
+from quantization import KMeansTrainableQuantizer
+from JPEG_1D import BlockedDCTBottleneck
+
+QUANT_GLOBAL_INSPECT = False
+
+path_extract_PPdist = "./PP_3_ratio16_linear/"
 
 # ============================================================================
 # Bottleneck Modules for Compression
@@ -71,14 +83,26 @@ class AdaptiveBottleneck(nn.Module):
     Simple bottleneck layer that compresses hidden states to a lower dimension.
     Uses linear projection with activation for information compression.
     """
-    def __init__(self, hidden_size=768, ratio=2):
+    def __init__(self, hidden_size=768, ratio=2, n_bits=8, dct_k=768//2, dct_BLOCK=768):
         super().__init__()
         self.inner_dim = hidden_size // ratio
-        self.compress = nn.Linear(hidden_size, self.inner_dim, bias=False)
+        self.compress = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.compress_1 = nn.Linear(hidden_size, self.inner_dim, bias=False)
         self.decompress = nn.Linear(self.inner_dim, hidden_size, bias=False)
+        self.decompress_1 = nn.Linear(hidden_size, hidden_size, bias=False)
+
+
+        self.dct_k = dct_k
+        if dct_k > 0:
+            self.dct_module = BlockedDCTBottleneck(hidden_size=hidden_size//ratio, block_size=dct_BLOCK, compression_k=dct_k)
+        
+        self.n_bits = n_bits
+        if n_bits > 0:
+            print("IN ADAPTOVE BOTTLENECK n_bits: ", self.n_bits)
+            self.quantizer = KMeansTrainableQuantizer(num_bits=n_bits, train_params=True)
         self.act = nn.GELU()
         
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, T=10000.0):
         """
         Args:
             hidden_states: [batch, seq_len, hidden_size]
@@ -86,8 +110,86 @@ class AdaptiveBottleneck(nn.Module):
             decompressed: [batch, seq_len, hidden_size]
         """
         compressed = self.act(self.compress(hidden_states))
-        decompressed = self.decompress(compressed)
-        return decompressed
+        
+        #TODO
+        
+        #compressed = self.act(self.compress_1(compressed))
+        compressed = nn.ReLU()(self.compress_1(compressed))
+        # Partitioning Point
+        if QUANT_GLOBAL_INSPECT:
+            path_extract_PPdist = "./PP_3_ratio16_linear_test/"
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            path_extract_PPdist = path_extract_PPdist + str(timestamp) + ".pt"
+            print("Shape at partitioning point: ", compressed.shape)
+            dir_path = os.path.dirname(path_extract_PPdist)  # Extract the directory from the full path
+            if dir_path and not os.path.exists(dir_path):  # Check if directory exists (skip if path is just a filename)
+                os.makedirs(dir_path)  # Create the directory (and any parent directories)
+            torch.save(compressed.detach().cpu().flatten(), dir_path)
+        pp = None
+        if self.n_bits > 0 and self.dct_k == 0:
+            #fname = "before_quant_tmp.png"
+            #plt.hist(compressed.detach().flatten().cpu(), bins=300)
+            #save_path = os.path.join("./", fname)
+            #plt.savefig(save_path, dpi=150)
+            #plt.close()
+
+            compressed = self.quantizer(compressed, T)
+            #print("Unique values: ", len(torch.unique(compressed)))
+            
+            #fname = "after_quant_tmp.png"
+            #plt.hist(compressed.detach().flatten().cpu(), bins=300)
+            #save_path = os.path.join("./", fname)
+            #plt.savefig(save_path, dpi=150)
+            #plt.close()
+        elif self.n_bits == 0 and self.dct_k > 0:
+            #print("n bits is 0 and DCT_k is not 0")
+            #print(compressed.shape)
+            compressed, pp = self.dct_module(compressed)
+            
+
+
+        decompressed = self.act(self.decompress(compressed))
+        decompressed = self.decompress_1(decompressed)
+        return decompressed, pp
+
+
+class AdaptiveBottleneckConv(nn.Module):
+    """
+    Simple bottleneck layer that compresses hidden states to a lower dimension.
+    Uses linear projection with activation for information compression.
+    """
+    def __init__(self, hidden_size=768, ratio=2):
+        super().__init__()
+        self.inner_dim = hidden_size // ratio
+        self.compress = nn.Conv1d(hidden_size, hidden_size//5, kernel_size=5, stride=1, padding=0, bias=False)
+        self.compress_1 = nn.Conv1d(hidden_size//5, self.inner_dim, kernel_size=5, stride=1, padding=0, bias=False)
+        self.decompress = nn.Conv1d(self.inner_dim, hidden_size//5, kernel_size=5, stride=1, padding=0, bias=False)
+        self.decompress_1 = nn.Conv1d(hidden_size//5, hidden_size, kernel_size=5, stride=1, padding=0, bias=False)
+        
+        self.act = nn.GELU()
+        
+    def forward(self, hidden_states, T):
+        """
+        Args:
+            hidden_states: [batch, seq_len, hidden_size]
+        Returns:
+            decompressed: [batch, seq_len, hidden_size]
+        """
+        hidden_states = hidden_states.transpose(1, 2).contiguous()
+        hidden_states = F.pad(hidden_states, (5 - 1, 0), mode='constant', value=0)
+
+        compressed = self.act(self.compress(hidden_states))
+        #print(compressed.shape)
+        compressed = F.pad(compressed, (5 - 1, 0), mode='constant', value=0)
+        compressed = self.act(self.compress_1(compressed))
+        # Partitioning Point
+        #print(compressed.shape)
+        compressed = F.pad(compressed, (5 - 1, 0), mode='constant', value=0)
+        decompressed = self.act(self.decompress(compressed))
+        decompressed = F.pad(decompressed, (5 - 1, 0), mode='constant', value=0)
+        decompressed = self.decompress_1(decompressed)
+        
+        return decompressed.transpose(1, 2).contiguous(), None
 
 
 # this was for some experiments for gated progressive Bottleneck
@@ -134,7 +236,7 @@ class SplitBottleneck(nn.Module):
 class GPT2ModelCompress(GPT2PreTrainedModel):
     _supports_param_buffer_assignment = False
 
-    def __init__(self, config, bl_layer=None, bl_ratio=2, BL_type="linear"):
+    def __init__(self, config, bl_layer=None, bl_ratio=2, BL_type="linear", n_bits=8, dct_k=768, dct_BLOCK=768):
         super().__init__(config)
 
         self.embed_dim = config.hidden_size
@@ -159,7 +261,7 @@ class GPT2ModelCompress(GPT2PreTrainedModel):
         if bl_layer is not None:
             self.bl_layer = bl_layer
             if BL_type == "linear":
-                self.bottleneck = AdaptiveBottleneck(ratio=bl_ratio) # SplitBottleneck(ratio=bl_ratio) #   AdaptiveBottleneck(ratio=bl_ratio)
+                self.bottleneck = AdaptiveBottleneck(ratio=bl_ratio, n_bits=n_bits, dct_k=dct_k, dct_BLOCK=dct_BLOCK) # SplitBottleneck(ratio=bl_ratio) #   AdaptiveBottleneck(ratio=bl_ratio)
             elif BL_type == "attention":
                 print("Using Attention: ")
                 config_BL = GPT2Config(
@@ -172,12 +274,18 @@ class GPT2ModelCompress(GPT2PreTrainedModel):
                     activation_function="gelu_new",
                     _attn_implementation="eager"
                 )
+                config_BL.embd_pdrop = 0.0
+                config_BL.attn_pdrop = 0.0
+                config_BL.resid_pdrop = 0.0
                 config_BL_dec = copy.deepcopy(config_BL)
                 config_BL_dec.hidden_size = int(config_BL.hidden_size / bl_ratio)
                 print("config hidden shape: ", config_BL.hidden_size)
                 print("config_dec hidden shape: ", config_BL_dec.hidden_size)
                 self.bottleneck_enc = GPT2BlockSplit(config_BL, layer_idx=0, ratio=bl_ratio)
                 self.bottleneck_dec = GPT2BlockSplit(config_BL_dec, layer_idx=1, ratio=1/bl_ratio)
+            elif BL_type == "conv":
+                self.bottleneck = AdaptiveBottleneckConv(ratio=bl_ratio)
+
     def get_input_embeddings(self):
         return self.wte
 
@@ -200,6 +308,7 @@ class GPT2ModelCompress(GPT2PreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        T: Optional[float] = 10000.0,
         **kwargs,
     ) -> Union[tuple, BaseModelOutputWithPastAndCrossAttentions]:
         r"""
@@ -284,6 +393,8 @@ class GPT2ModelCompress(GPT2PreTrainedModel):
             position_ids=position_ids,
         )
 
+        #print("Attention_mask: ", attention_mask.shape)
+
         # If a 2D or 3D attention mask is provided for the cross-attention
         # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
         _use_sdpa = self._attn_implementation == "sdpa" and output_attentions is False
@@ -312,14 +423,17 @@ class GPT2ModelCompress(GPT2PreTrainedModel):
         all_self_attentions = () if output_attentions else None
         all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
         all_hidden_states = () if output_hidden_states else None
+        compressed = None
         for i, block in enumerate(self.h):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
             if self.bl_layer == i:
                 #print(f"Bottleneck at layer {i}")
-                if self.BL_type == "linear":
-                    hidden_states = self.bottleneck(hidden_states)
+                if self.BL_type == "linear" or self.BL_type == "conv":
+                    input_hs = hidden_states
+                    hidden_states, compressed = self.bottleneck(hidden_states, T)
+                    output_hs = hidden_states
                 elif self.BL_type == "attention":
                     #hidden_states = self.bottleneck(hidden_states)
                     input_hs = hidden_states
@@ -391,7 +505,7 @@ class GPT2ModelCompress(GPT2PreTrainedModel):
             hidden_states=all_hidden_states,
             attentions=all_self_attentions,
             cross_attentions=all_cross_attentions,
-        ), (input_hs, output_hs)
+        ), (input_hs, output_hs), compressed
 
 
 class GPT2LMHeadModelCompress(GPT2PreTrainedModel, GenerationMixin):
@@ -401,13 +515,13 @@ class GPT2LMHeadModelCompress(GPT2PreTrainedModel, GenerationMixin):
     """
     _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config, bl_layer=None, bl_ratio=2, BL_type="linear"):
+    def __init__(self, config, bl_layer=None, bl_ratio=2, BL_type="linear", pretrain=True, n_bits=8, dct_k=768, dct_BLOCK=768):
         super().__init__(config)
         print(f"Initializing GPT2LMHeadModelCompress (bl_layer={bl_layer}, bl_ratio={bl_ratio})")
         
-        self.transformer = GPT2ModelCompress(config, bl_layer=bl_layer, bl_ratio=bl_ratio, BL_type=BL_type)
+        self.transformer = GPT2ModelCompress(config, bl_layer=bl_layer, bl_ratio=bl_ratio, BL_type=BL_type, n_bits=n_bits, dct_k=dct_k, dct_BLOCK=dct_BLOCK)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-
+        self.pretrain = pretrain
         self.post_init()
 
     def forward(
@@ -434,7 +548,7 @@ class GPT2LMHeadModelCompress(GPT2PreTrainedModel, GenerationMixin):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         # Get transformer outputs
-        transformer_outputs, hs_pretrain = self.transformer(
+        transformer_outputs, hs_pretrain, compressed = self.transformer(
             input_ids,
             past_key_values=past_key_values,
             attention_mask=attention_mask,
@@ -448,6 +562,7 @@ class GPT2LMHeadModelCompress(GPT2PreTrainedModel, GenerationMixin):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            T=T,
         )
         
         hidden_states = transformer_outputs[0]
@@ -467,13 +582,22 @@ class GPT2LMHeadModelCompress(GPT2PreTrainedModel, GenerationMixin):
             output = (logits,) + transformer_outputs[1:]
             return ((loss,) + output) if loss is not None else output
 
-        return CausalLMOutputWithCrossAttentions(
-            loss=loss,
-            logits=logits,
-            past_key_values=transformer_outputs.past_key_values,
-            hidden_states=transformer_outputs.hidden_states,
-            attentions=transformer_outputs.attentions,
-        ), hs_pretrain
+        if self.pretrain:
+            return CausalLMOutputWithCrossAttentions(
+                loss=loss,
+                logits=logits,
+                past_key_values=transformer_outputs.past_key_values,
+                hidden_states=transformer_outputs.hidden_states,
+                attentions=transformer_outputs.attentions,
+            ), hs_pretrain, compressed
+        else:
+            return CausalLMOutputWithCrossAttentions(
+                loss=loss,
+                logits=logits,
+                past_key_values=transformer_outputs.past_key_values,
+                hidden_states=transformer_outputs.hidden_states,
+                attentions=transformer_outputs.attentions,
+            )
 
 
 # Export standard GPT2LMHeadModel for compatibility
@@ -495,12 +619,11 @@ if __name__ == "__main__":
     from torch.optim import AdamW
     from torch.optim.lr_scheduler import CosineAnnealingLR
     from torch.nn.utils import clip_grad_norm_
-
-    # Assuming train_dataloader, eval_dataloader, tokenizer, device are defined earlier from Alpaca prep
+    import torch
+    import matplotlib.pyplot as plt
+    # Assuming pretrain_train_dataloader, pretrain_eval_dataloader, tokenizer, device are defined earlier from Alpaca prep
     # Also assuming CFG_M, CombinedLoss, GPT2LMHeadModelCompress are defined
-
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_path', type=str, default='collected_hidden_states/real_hidden_data_3_16')  # Unused if using Alpaca; keep for compatibility
     parser.add_argument('--max_length', type=int, default=None)
     parser.add_argument('--train_split', type=float, default=0.9)
     parser.add_argument('--hidden_dim', type=int, default=768)
@@ -513,79 +636,166 @@ if __name__ == "__main__":
     parser.add_argument('--cosine_weight', type=float, default=0.1)
     parser.add_argument('--output_dir', type=str, default='checkpoints_bottleneck')
     parser.add_argument('--model_name', type=str, default='adaptive_bottleneck')
-    parser.add_argument('--save_every', type=int, default=1)
+    parser.add_argument('--save_every', type=int, default=20)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--use_config', action='store_true')
     args = parser.parse_args()
-
     cfg_m = CFG_M()
     print("Chosen ratio: ", cfg_m.bl_ratio)
-
     # SLURM: disable workers
     num_workers = args.num_workers
     if 'SLURM_JOB_ID' in os.environ:
         print("SLURM detected → num_workers=0")
         num_workers = 0
-
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-
-    out_dir = Path(args.output_dir) / f"_r_{cfg_m.bl_ratio}_pos_{cfg_m.bl_layer}_type_{cfg_m.BL_type}"
+    out_dir = Path(args.output_dir) / f"_r_{cfg_m.bl_ratio}_pos_{cfg_m.bl_layer}_type_{cfg_m.BL_type}_qbits_{cfg_m.quant_bits}_dctk_{cfg_m.dct_k}_dctBLOCK_{cfg_m.dct_BLOCK}"
     out_dir.mkdir(parents=True, exist_ok=True)
-    with open(out_dir / "args.json", "w") as f:
-        json.dump(vars(args), f, indent=2)
-
+    plot_dir = Path("imgs_pretrain") / f"type_{cfg_m.BL_type}_ratio_{cfg_m.bl_ratio}_pos_{cfg_m.bl_layer}_qbits_{cfg_m.quant_bits}_dctk_{cfg_m.dct_k}_dctBLOCK_{cfg_m.dct_BLOCK}"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    #with open(out_dir / "args.json", "w") as f:
+    #    json.dump(vars(args), f, indent=2)
     print(f"Device: {device}")
-
     # Load config and models
-    model_name = "gpt2"  # Or from cfg_m if defined
+
+
+
+    model_name = "gpt2"
     config = GPT2Config.from_pretrained(model_name)
+
+    # Disable all dropouts globally
+    config.embd_pdrop = 0.0
+    config.attn_pdrop = 0.0
+    config.resid_pdrop = 0.0
+
     model = GPT2LMHeadModelCompress(
         config,
         bl_layer=cfg_m.bl_layer,
         bl_ratio=cfg_m.bl_ratio,
-        BL_type=cfg_m.BL_type
+        BL_type=cfg_m.BL_type,
+        n_bits=cfg_m.quant_bits,
+        dct_k=cfg_m.dct_k,
+        dct_BLOCK=cfg_m.dct_BLOCK
     ).to(device)
+
     original_model = GPT2LMHeadModel.from_pretrained(model_name)
     model.transformer.load_state_dict(original_model.transformer.state_dict(), strict=False)
     model.lm_head.weight = model.transformer.wte.weight  # Tie weights
     del original_model  # Free memory
 
+    
     # Freeze everything except bottleneck
     for name, param in model.named_parameters():
-        if "bottleneck_enc" in name or "bottleneck_dec" in name:
+        if "bottleneck_enc" in name or "bottleneck_dec" in name or "bottleneck" in name:
             param.requires_grad = True
         else:
             param.requires_grad = False
-
     print(f"Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
     print(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
+    
+    # quantization
+    if cfg_m.BL_type == "linear" and cfg_m.quant_bits > 0:
+        # load data
+        dir_path = path_extract_PPdist
+        file_paths = sorted(glob.glob(os.path.join(dir_path, "*.pt")))  # Use glob to get all .pt files
 
+        tensors = []
+        for path in file_paths:
+            loaded = torch.load(path)
+            if isinstance(loaded, dict) and "tensor" in loaded:
+                tensors.append(loaded["tensor"])
+            else:  
+                tensors.append(loaded)
+
+        # Concatenate all tensors along dimension 0 (assumes they have compatible shapes, e.g., all 1D or same dims except 0)
+        # If shapes differ, you may need to reshape or use torch.stack() for a new dimension
+        big_tensor = torch.cat(tensors, dim=0)
+        big_tensor = big_tensor.flatten()
+        
+        fname = "temp_before.png"
+        plt.hist(big_tensor.detach().flatten().cpu(), bins=300)
+        
+        save_path = os.path.join("./", fname)
+        plt.savefig(save_path, dpi=150)
+        plt.close()
+
+
+        model.transformer.bottleneck.quantizer.initialize_from_data(big_tensor)
+        
+        big_tensor = model.transformer.bottleneck.quantizer(big_tensor.to(device), T=torch.tensor(1.0))
+        print("UNIQUE VALs: ", len(torch.unique(big_tensor)))
+        #fname = "temp_after.png"
+        #plt.hist(big_tensor.detach().flatten().cpu(), bins=32)
+        #save_path = os.path.join("./", fname)
+        #plt.savefig(save_path, dpi=150)
+        #plt.close()
+
+        print(model.transformer.bottleneck.quantizer)
+
+        # Separate quantizer params for lower LR
+        quantizer_params = []
+        other_params = []
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                if "quantizer" in name:  # Matches any param with 'quantizer' in the name (e.g., transformer.bottleneck.quantizer.centroids)
+                    quantizer_params.append(param)
+                else:
+                    other_params.append(param)
+
+        print(f"Quantizer params: {sum(p.numel() for p in quantizer_params):,}")
+        print(f"Other trainable params: {sum(p.numel() for p in other_params):,}")
+
+    
     # Optimizer, scheduler, criterion
-    optimizer = AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=args.lr,
-        weight_decay=args.weight_decay
-    )
+    #optimizer = AdamW(
+    #    filter(lambda p: p.requires_grad, model.parameters()),
+    #    lr=args.lr,
+    #    weight_decay=args.weight_decay
+    #)
+        optimizer = AdamW([
+            {'params': other_params, 'lr': args.lr, 'weight_decay': args.weight_decay},
+            {'params': quantizer_params, 'lr': args.lr / 500, 'weight_decay': args.weight_decay}  # Optionally adjust weight_decay here if needed
+        ])
+    elif cfg_m.quant_bits == 0:
+        optimizer = AdamW([
+            {'params': model.parameters(), 'lr': args.lr, 'weight_decay': args.weight_decay}, # Optionally adjust weight_decay here if needed
+        ])
+
+
+
+    #print(optimizer.param_groups)
+
     scheduler = CosineAnnealingLR(optimizer, T_max=args.num_epochs)
     criterion = CombinedLoss(mse_weight=args.mse_weight, cosine_weight=args.cosine_weight)
-
-    def train_epoch(model, dataloader, optimizer, criterion, device, epoch):
+    def train_epoch(model, dataloader, optimizer, criterion, device, epoch, T):
         model.train()
         total_loss, total_mse, total_cos = 0, 0, 0
         num_batches = 0
         for step, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch}")):
             batch = {k: v.to(device) for k, v in batch.items()}
             optimizer.zero_grad()
-            transformer_outputs, (hidden_before, hidden_after) = model.transformer(
+            transformer_outputs, (hidden_before, hidden_after), compressed = model.transformer(
                 input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"]
+                attention_mask=batch["attention_mask"],
+                T=T,
             )
+            #print("hidden_before shape: ", hidden_before.shape)
+            #print("hidden_after shape: ", hidden_after.shape)
             lengths = batch["attention_mask"].sum(dim=1)
+            #print("Lenghts: ", lengths)
+            #print(batch["attention_mask"])
+
             loss, mse, cos = criterion(hidden_after, hidden_before, lengths)
+            if cfg_m.dct_reg and cfg_m.dct_k > 0:
+                #print("regualrize DCT")
+                loss += 0.01 * torch.sum(compressed[..., cfg_m.dct_k:] ** 2)
+
             loss.backward()
             clip_grad_norm_(model.parameters(), 1.0)
+            
+
+
             optimizer.step()
             total_loss += loss.item()
             total_mse += mse.item()
@@ -594,7 +804,6 @@ if __name__ == "__main__":
             if step % 50 == 0:
                 print(f"Step {step} | Loss: {loss.item():.4f} | MSE: {mse.item():.4f} | Cos: {cos.item():.4f} | LR: {scheduler.get_last_lr()[0]:.2e}")
         return total_loss / num_batches, total_mse / num_batches, total_cos / num_batches
-
     def validate(model, dataloader, criterion, device):
         model.eval()
         total_loss, total_mse, total_cos = 0, 0, 0
@@ -602,9 +811,10 @@ if __name__ == "__main__":
         with torch.no_grad():
             for batch in dataloader:
                 batch = {k: v.to(device) for k, v in batch.items()}
-                _, (hidden_before, hidden_after) = model.transformer(
+                _, (hidden_before, hidden_after), _ = model.transformer(
                     input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"]
+                    attention_mask=batch["attention_mask"],
+                    T=torch.tensor(999999999.9)
                 )
                 lengths = batch["attention_mask"].sum(dim=1)
                 loss, mse, cos = criterion(hidden_after, hidden_before, lengths)
@@ -613,7 +823,6 @@ if __name__ == "__main__":
                 total_cos += cos.item()
                 num_batches += 1
         return total_loss / num_batches, total_mse / num_batches, total_cos / num_batches
-
     def save_checkpoint(model, optimizer, epoch, val_loss, path, args):
         torch.save({
             'model_state_dict': model.state_dict(),
@@ -622,14 +831,28 @@ if __name__ == "__main__":
             'val_loss': val_loss,
             'args': vars(args)
         }, path)
-
     # Training loop
     best_val = float('inf')
+    train_losses = []
+    val_losses = []
     for epoch in range(1, args.num_epochs + 1):
-        train_loss, train_mse, train_cos = train_epoch(model, train_dataloader, optimizer, criterion, device, epoch)
-        val_loss, val_mse, val_cos = validate(model, eval_dataloader, criterion, device)
+        train_loss, train_mse, train_cos = train_epoch(model, pretrain_train_dataloader, optimizer, criterion, device, epoch, T=torch.tensor(epoch*1).to(device))
+        val_loss, val_mse, val_cos = validate(model, pretrain_eval_dataloader, criterion, device)
         scheduler.step()
         print(f"\nEpoch {epoch} | Train Loss: {train_loss:.4f} (MSE: {train_mse:.4f}, Cos: {train_cos:.4f}) | Val Loss: {val_loss:.4f} (MSE: {val_mse:.4f}, Cos: {val_cos:.4f})")
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        # Plot losses
+        epochs_list = list(range(1, len(train_losses) + 1))
+        plt.figure()
+        plt.plot(epochs_list, train_losses, label='Train Loss')
+        plt.plot(epochs_list, val_losses, label='Val Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.title('Training and Validation Loss')
+        plt.savefig(plot_dir / f"loss_epoch_{epoch}.png")
+        plt.close()
         if epoch % args.save_every == 0:
             save_checkpoint(model, optimizer, epoch, val_loss, out_dir / f"epoch_{epoch}.pt", args)
         if val_loss < best_val:
