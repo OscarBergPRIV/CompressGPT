@@ -94,7 +94,7 @@ def eager_attention_forward(module, query, key, value, attention_mask, **kwargs)
 
 
 class GPT2Attention(nn.Module):
-    def __init__(self, config, is_cross_attention=False, layer_idx=None):
+    def __init__(self, config, is_cross_attention=False, layer_idx=None, svd_r=1.0):
         super().__init__()
         self.config = config
         max_positions = config.max_position_embeddings
@@ -106,6 +106,8 @@ class GPT2Attention(nn.Module):
             persistent=False,
         )
         self.register_buffer("masked_bias", torch.tensor(-1e4), persistent=False)
+
+        self.svd_r = svd_r
 
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -133,22 +135,23 @@ class GPT2Attention(nn.Module):
 
 
         # ADAPT FOR BETTER SVD PROJECTION
-        self.WQ_H = nn.ModuleList([
-            nn.Linear(self.embed_dim, self.head_dim, bias=True)
-            for _ in range(self.num_heads)
-        ])
+        self.WQ = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
+        self.WK = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
+        self.WV = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
+                
+        self.WQ_A = nn.Linear(self.embed_dim, int(self.embed_dim*svd_r), bias=False)
+        self.WQ_B = nn.Linear(int(self.embed_dim*svd_r), self.embed_dim, bias=True)
+        self.WK_A = nn.Linear(self.embed_dim, int(self.embed_dim*svd_r), bias=False)
+        self.WK_B = nn.Linear(int(self.embed_dim*svd_r), self.embed_dim, bias=True)
+        self.WV_A = nn.Linear(self.embed_dim, int(self.embed_dim*svd_r), bias=False)
+        self.WV_B = nn.Linear(int(self.embed_dim*svd_r), self.embed_dim, bias=True)
+        #print("WV A: ", self.WV_A)
+        #print("WV B: ", self.WV_B)
+        #print("WK A: ", self.WK_A)
+        #print("WK B: ", self.WK_B)
+        #print("WQ: ", self.WQ)
         
-        # W_K heads: [embed_dim, head_dim] * num_heads
-        self.WK_H = nn.ModuleList([
-            nn.Linear(self.embed_dim, self.head_dim, bias=True)
-            for _ in range(self.num_heads)
-        ])
         
-        # W_V heads: [embed_dim, head_dim] * num_heads
-        self.WV_H = nn.ModuleList([
-            nn.Linear(self.embed_dim, self.head_dim, bias=True)
-            for _ in range(self.num_heads)
-        ])
         
 
         ###############################################
@@ -159,47 +162,91 @@ class GPT2Attention(nn.Module):
         self.resid_dropout = nn.Dropout(config.resid_pdrop)
         self.is_causal = not is_cross_attention
 
+    def translate_SVD(self):
+        """
+        Convert the full WK / WV matrices into SVD-factorized
+        2-layer decompositions (A and B) with optional low-rank r.
+        Skip Q matrix.
+        
+        If rank=None → use full rank (embed_dim).
+        If rank=r → use truncated SVD of rank r*embed_dim.
+        """
+        # Determine maximum possible rank
+        
+        r = int(self.svd_r * self.embed_dim)
+        print(f"[translate_SVD] Using rank = {r} (max = {self.embed_dim})")
+        
+        # Helper: factorize a (embed_dim × embed_dim) projection matrix W
+        def factorize(W, b):
+            # W shape: (embed_dim, embed_dim)
+            U, S, Vh = torch.linalg.svd(W, full_matrices=False)
+            # Truncate to rank r
+            U = U[:, :r]          # (embed_dim, r)
+            S = S[:r]             # (r,)
+            Vh = Vh[:r, :]        # (r, embed_dim)
+            # Fuse sqrt(S) into U and V
+            sqrtS = torch.sqrt(S)
+            U_fused = U * sqrtS.unsqueeze(0)      # (embed_dim, r)
+            V_fused = (Vh.T * sqrtS.unsqueeze(0)) # (embed_dim, r)
+            return U_fused, V_fused, b
+        
+        # -------------------------------------------------------
+        # K projection
+        # -------------------------------------------------------
+        W = self.WK.weight.data.clone()
+        b = self.WK.bias.data.clone()
+        U_fused, V_fused, b = factorize(W, b)
+        self.WK_A.weight.data = V_fused.T.clone()
+        self.WK_B.weight.data = U_fused.clone()
+        self.WK_B.bias.data   = b.clone()
+        
+        # -------------------------------------------------------
+        # V projection
+        # -------------------------------------------------------
+        W = self.WV.weight.data.clone()
+        b = self.WV.bias.data.clone()
+        U_fused, V_fused, b = factorize(W, b)
+        self.WV_A.weight.data = V_fused.T.clone()
+        self.WV_B.weight.data = U_fused.clone()
+        self.WV_B.bias.data   = b.clone()
+        
+        print("[translate_SVD] SVD factorization + low-rank projection complete.")
+
+
+
     def translate_weights(self):
         """
-        Translate weights and biases from self.c_attn to the per-head linear layers.
+        Translate weights and biases from self.c_attn to the full WQ, WK, WV linear layers (not separated by heads).
         Call this after loading the pretrained weights into self.c_attn.
         """
         if not hasattr(self, 'c_attn') or self.c_attn is None:
             raise ValueError("self.c_attn must be loaded with weights first.")
-        print("Translate weights in Linear Layers")
-        
+        print("Translate weights to full Q/K/V projection layers")
+
         weight = self.c_attn.weight.data  # shape: (embed_dim, 3 * embed_dim)
         bias = self.c_attn.bias.data  # shape: (3 * embed_dim)
-        
-        q_weight = weight[:, 0:self.embed_dim]  # (embed_dim, embed_dim)
+
+        q_weight = weight[:, 0:self.embed_dim]  # (embed_dim, embed_dim) -> (in, out)
         k_weight = weight[:, self.embed_dim:2 * self.embed_dim]  # (embed_dim, embed_dim)
         v_weight = weight[:, 2 * self.embed_dim:3 * self.embed_dim]  # (embed_dim, embed_dim)
-        
+
         q_bias = bias[0:self.embed_dim]  # (embed_dim,)
         k_bias = bias[self.embed_dim:2 * self.embed_dim]  # (embed_dim,)
         v_bias = bias[2 * self.embed_dim:3 * self.embed_dim]  # (embed_dim,)
-        
-        for i in range(self.num_heads):
-            start = i * self.head_dim
-            end = (i + 1) * self.head_dim
-            
-            # For Q
-            head_q = q_weight[:, start:end]  # (embed_dim, head_dim)
-            self.WQ_H[i].weight.data = head_q.T  # (head_dim, embed_dim)
-            self.WQ_H[i].bias.data = q_bias[start:end]  # (head_dim,)
-            
-            # For K
-            head_k = k_weight[:, start:end]  # (embed_dim, head_dim)
-            self.WK_H[i].weight.data = head_k.T  # (head_dim, embed_dim)
-            self.WK_H[i].bias.data = k_bias[start:end]  # (head_dim,)
-            
-            # For V
-            head_v = v_weight[:, start:end]  # (embed_dim, head_dim)
-            self.WV_H[i].weight.data = head_v.T  # (head_dim, embed_dim)
-            self.WV_H[i].bias.data = v_bias[start:end]  # (head_dim,)
-        
+
+        # Set weights for WQ, WK, WV
+        # nn.Linear weight is (out, in), so transpose the sliced weights
+        self.WQ.weight.data = q_weight.T  # (embed_dim, embed_dim)
+        self.WQ.bias.data = q_bias
+
+        self.WK.weight.data = k_weight.T  # (embed_dim, embed_dim)
+        self.WK.bias.data = k_bias
+
+        self.WV.weight.data = v_weight.T  # (embed_dim, embed_dim)
+        self.WV.bias.data = v_bias
+
         # Optionally, delete the original c_attn to save memory
-        #del self.c_attn
+        # del self.c_attn
 
     def _upcast_and_reordered_attn(self, query, key, value, attention_mask=None):
         # Use `torch.baddbmm` (a bit more efficient w/ alpha param for scaling -- from Megatron-LM)
@@ -292,21 +339,45 @@ class GPT2Attention(nn.Module):
                 key_states = key_states.view(shape_kv).transpose(1, 2)
                 value_states = value_states.view(shape_kv).transpose(1, 2)
         else:
-            query_states, key_states, value_states = self.c_attn(hidden_states).split(self.split_size, dim=2)
+            #query_states, key_states, value_states = self.c_attn(hidden_states).split(self.split_size, dim=2)
+            query_states = self.WQ(hidden_states)
+            key_states = self.WK_B(self.WK_A(hidden_states))
+            value_states = self.WV_B(self.WV_A(hidden_states))
+
+
+
             shape_kv = (*key_states.shape[:-1], -1, self.head_dim)
-            
-            
-            #key_states = key_states.view(shape_kv).transpose(1, 2)
-            #value_states = value_states.view(shape_kv).transpose(1, 2)
+            key_states = key_states.view(shape_kv).transpose(1, 2)
+            value_states = value_states.view(shape_kv).transpose(1, 2)
+            # Full weights
+            #key_states = torch.stack([self.WK_H[i](hidden_states) for i in range(self.num_heads)], dim=1)
+            #value_states = torch.stack([self.WV_H[i](hidden_states) for i in range(self.num_heads)], dim=1)
+            #key_states = torch.stack(
+            #    [self.WK_B[i](self.WK_A[i](hidden_states)) for i in range(self.num_heads)],
+            #    dim=1
+            #)
 
+            # VALUE
+            #value_states = torch.stack(
+            #    [self.WV_B[i](self.WV_A[i](hidden_states)) for i in range(self.num_heads)],
+            #    dim=1
+            #)
             
-            key_states = torch.stack([self.WK_H[i](hidden_states) for i in range(self.num_heads)], dim=1)
-            value_states = torch.stack([self.WV_H[i](hidden_states) for i in range(self.num_heads)], dim=1)
 
 
-        shape_q = (*query_states.shape[:-1], -1, self.head_dim)
         #query_states = query_states.view(shape_q).transpose(1, 2)
-        query_states = torch.stack([self.WQ_H[i](hidden_states) for i in range(self.num_heads)], dim=1)
+        # Full weights
+        #query_states = torch.stack([self.WQ_H[i](hidden_states) for i in range(self.num_heads)], dim=1)
+        shape_q = (*query_states.shape[:-1], -1, self.head_dim)
+        query_states = query_states.view(shape_q).transpose(1, 2)
+        print("Query shapes: ", query_states.shape)
+        print("Key shapes: ", key_states.shape)
+        print("Value shapes: ", value_states.shape)
+        
+        #query_states = torch.stack(
+        #    [self.WQ_B[i](self.WQ_A[i](hidden_states)) for i in range(self.num_heads)],
+        #    dim=1
+        #)
 
 
         if (past_key_values is not None and not is_cross_attention) or (
@@ -366,13 +437,13 @@ class GPT2MLP(nn.Module):
 
 
 class GPT2Block(GradientCheckpointingLayer):
-    def __init__(self, config, layer_idx=None):
+    def __init__(self, config, layer_idx=None, svd_r=1.0):
         super().__init__()
         hidden_size = config.hidden_size
         inner_dim = config.n_inner if config.n_inner is not None else 4 * hidden_size
 
         self.ln_1 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
-        self.attn = GPT2Attention(config=config, layer_idx=layer_idx)
+        self.attn = GPT2Attention(config=config, layer_idx=layer_idx, svd_r=svd_r)
         self.ln_2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
 
         if config.add_cross_attention:
@@ -444,7 +515,7 @@ class GPT2Block(GradientCheckpointingLayer):
 class GPT2ModelCompress(GPT2PreTrainedModel):
     _supports_param_buffer_assignment = False
 
-    def __init__(self, config, bl_layer=None, bl_ratio=2, BL_type="linear"):
+    def __init__(self, config, bl_layer=None, bl_ratio=2, BL_type="linear", svd_r=1.0):
         super().__init__(config)
 
         self.embed_dim = config.hidden_size
@@ -453,7 +524,7 @@ class GPT2ModelCompress(GPT2PreTrainedModel):
         self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
 
         self.drop = nn.Dropout(config.embd_pdrop)
-        self.h = nn.ModuleList([GPT2Block(config, layer_idx=i) for i in range(config.num_hidden_layers)])
+        self.h = nn.ModuleList([GPT2Block(config, layer_idx=i, svd_r=svd_r) for i in range(config.num_hidden_layers)])
         self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
 
         self.gradient_checkpointing = False
@@ -644,18 +715,18 @@ class GPT2ModelCompress(GPT2PreTrainedModel):
         )
 
 
-class GPT2LMHeadModelCompress(GPT2PreTrainedModel, GenerationMixin):
+class GPT2LMHeadModelSVD(GPT2PreTrainedModel, GenerationMixin):
     """
     GPT-2 Language Model with compression bottleneck.
     Maintains compatibility with HuggingFace generation methods.
     """
     _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config, bl_layer=None, bl_ratio=2, BL_type="linear"):
+    def __init__(self, config, bl_layer=None, svd_r=1.00):
         super().__init__(config)
-        print(f"Initializing GPT2LMHeadModelCompress (bl_layer={bl_layer}, bl_ratio={bl_ratio})")
+        #print(f"Initializing GPT2LMHeadModelSVD (bl_layer={bl_layer}, bl_ratio={bl_ratio})")
         
-        self.transformer = GPT2ModelCompress(config, bl_layer=bl_layer, bl_ratio=bl_ratio, BL_type=BL_type)
+        self.transformer = GPT2ModelCompress(config, svd_r=svd_r)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
         self.post_init()
@@ -737,7 +808,7 @@ GPT2LMHeadModel = HF_GPT2LMHeadModel
 if __name__ == "__main__":
 
 
-    print("FULL COMPARISON: Official GPT2LMHeadModel vs GPT2LMHeadModelCompress\n")
+    print("FULL COMPARISON: Official GPT2LMHeadModel vs GPT2LMHeadModelSVD\n")
 
     model_name = "gpt2"  # or "gpt2-medium", "gpt2-large", "gpt2-xl"
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -756,7 +827,7 @@ if __name__ == "__main__":
     # =============================================================
     bl_layer = 2
     config = GPT2Config.from_pretrained(model_name)
-    my_model = GPT2LMHeadModelCompress(config)
+    my_model = GPT2LMHeadModelSVD(config)
 
     # Copy weights from official model's transformer
     my_model.transformer.load_state_dict(official_model.transformer.state_dict(), strict=False)  # strict=False to enable Bottleneck layer loading
@@ -775,6 +846,7 @@ if __name__ == "__main__":
     for i in range(12):
 
         my_model.transformer.h[i].attn.translate_weights()
+        my_model.transformer.h[i].attn.translate_SVD(rank=1.00)
 
     # =============================================================
     # 3. Tokenizer
@@ -787,7 +859,7 @@ if __name__ == "__main__":
     # 4. Test inputs
     # =============================================================
     # Real text (more meaningful than random)
-    prompt = "The future of artificial intelligence is"
+    prompt = "The future of evolutionary computation is"
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
     input_ids = inputs["input_ids"]
 
